@@ -1,0 +1,8 @@
+# Moodle 5.3 su Aruba: inoltra tutte le richieste dentro public/
+Options -Indexes
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+    RewriteRule ^public/ - [L]
+    RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>

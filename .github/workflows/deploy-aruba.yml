@@ -1,0 +1,29 @@
+name: Pubblica Moodle su Aruba
+# Carica via FTP su Aruba solo i file cambiati. Si avvia solo a mano:
+# Actions -> "Pubblica Moodle su Aruba" -> Run workflow -> ramo "bbq".
+# Prima di lanciarlo: Moodle in Modalita manutenzione.
+# Dopo: aprire https://www.cominciadaqui.it/admin per aggiornare il database.
+on:
+  workflow_dispatch:
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/bbq'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USER }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          server-dir: /www.cominciadaqui.it/
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            **/.DS_Store
+            config.php
+            moodledata/**
+            cgi-bin/**
+            _moodle50_old/**
