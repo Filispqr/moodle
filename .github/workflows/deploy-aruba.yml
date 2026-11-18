@@ -21,6 +21,9 @@ env:
   SITO_FTP: www.cominciadaqui.it            # cartella del sito vista dall'FTP
   SITO_URL: https://www.cominciadaqui.it
   DATAROOT: /web/htdocs/www.cominciadaqui.it/home/moodledata
+  # FTP di Aruba: il certificato TLS non corrisponde al nome del server FTP, quindi
+  # --insecure (scelta di Filiberto, 18/11/2026): la connessione resta cifrata ma il
+  # certificato non viene verificato, come faceva FTP-Deploy-Action.
 
 jobs:
   deploy:
@@ -43,7 +46,7 @@ jobs:
           if [ "$INPUT_BASE" = "tutto" ]; then base=""
           elif [ -n "$INPUT_BASE" ]; then base="$INPUT_BASE"
           else
-            base=$(curl -sS --ssl-reqd --user "$FTP_USER:$FTP_PASSWORD" \
+            base=$(curl -sS --ssl-reqd --insecure --user "$FTP_USER:$FTP_PASSWORD" \
                    "ftp://$FTP_HOST/$SITO_FTP/.bbq-deploy-commit" 2>/dev/null | tr -dc '0-9a-f' || true)
           fi
           echo "Sul server: ${base:-nessuno (pubblico tutto)}"
@@ -62,7 +65,7 @@ jobs:
         run: |
           # Aggiorna comunque il segnaposto con il commit attuale (es. solo modifiche a .github).
           echo "$GITHUB_SHA" > marca.txt
-          curl -sS --fail --ssl-reqd --user "$FTP_USER:$FTP_PASSWORD" \
+          curl -sS --fail --ssl-reqd --insecure --user "$FTP_USER:$FTP_PASSWORD" \
                -T marca.txt "ftp://$FTP_HOST/$SITO_FTP/.bbq-deploy-commit"
           echo "Il server e' gia' aggiornato (commit \`${GITHUB_SHA::9}\`)." >> "$GITHUB_STEP_SUMMARY"
 
@@ -80,7 +83,7 @@ jobs:
           echo "ESTRATTORE=$nome" >> "$GITHUB_ENV"
           sed -e "s|__CHIAVE__|$chiave|" -e "s|__DATAROOT__|$DATAROOT|" .github/bbq/estrattore.php > "$nome"
 
-          ftp() { curl -sS --fail --ssl-reqd --ftp-create-dirs --retry 3 --user "$FTP_USER:$FTP_PASSWORD" "$@"; }
+          ftp() { curl -sS --fail --ssl-reqd --insecure --ftp-create-dirs --retry 3 --user "$FTP_USER:$FTP_PASSWORD" "$@"; }
           echo "Carico lo zip ($(du -h bbq-deploy.zip | cut -f1))..."
           ftp -T bbq-deploy.zip           "ftp://$FTP_HOST/$SITO_FTP/bbq-deploy.zip"
           ftp -T bbq-deploy-elimina.txt   "ftp://$FTP_HOST/$SITO_FTP/bbq-deploy-elimina.txt"
@@ -118,6 +121,6 @@ jobs:
         run: |
           # Toglie lo script temporaneo e lo zip anche se qualcosa e' andato storto.
           for f in "public/$ESTRATTORE" bbq-deploy.zip bbq-deploy-elimina.txt; do
-            curl -sS --ssl-reqd --user "$FTP_USER:$FTP_PASSWORD" "ftp://$FTP_HOST/" \
+            curl -sS --ssl-reqd --insecure --user "$FTP_USER:$FTP_PASSWORD" "ftp://$FTP_HOST/" \
                  -Q "DELE /$SITO_FTP/$f" -o /dev/null 2>/dev/null && echo "eliminato $f" || true
           done
