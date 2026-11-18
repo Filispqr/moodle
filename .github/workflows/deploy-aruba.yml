@@ -1,29 +1,123 @@
 name: Pubblica Moodle su Aruba
-# Carica via FTP su Aruba solo i file cambiati. Si avvia solo a mano:
-# Actions -> "Pubblica Moodle su Aruba" -> Run workflow -> ramo "bbq".
-# Prima di lanciarlo: Moodle in Modalita manutenzione.
-# Dopo: aprire https://www.cominciadaqui.it/admin per aggiornare il database.
+# Carica su Aruba SOLO i file cambiati dall'ultima pubblicazione, in un unico zip,
+# e lo fa scompattare sul server da uno script temporaneo (pochi minuti invece di ore).
+# Si avvia a mano: Actions -> "Pubblica Moodle su Aruba" -> Run workflow -> ramo "bbq".
+# Durante la copia il sito va da solo in manutenzione e poi torna online.
+# Dopo: se e' cambiata la versione di Moodle o di un plugin, aprire
+# https://www.cominciadaqui.it/admin e confermare l'aggiornamento del database.
 on:
   workflow_dispatch:
+    inputs:
+      base:
+        description: "Commit gia' presente sul server (vuoto = lo legge dal server; 'tutto' = ricarica tutto)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-aruba
+  cancel-in-progress: false
+
+env:
+  SITO_FTP: www.cominciadaqui.it            # cartella del sito vista dall'FTP
+  SITO_URL: https://www.cominciadaqui.it
+  DATAROOT: /web/htdocs/www.cominciadaqui.it/home/moodledata
+
 jobs:
   deploy:
     if: github.ref == 'refs/heads/bbq'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
-          server: ${{ secrets.FTP_HOST }}
-          username: ${{ secrets.FTP_USER }}
-          password: ${{ secrets.FTP_PASSWORD }}
-          protocol: ftps
-          server-dir: /www.cominciadaqui.it/
-          exclude: |
-            **/.git*
-            **/.git*/**
-            .github/**
-            **/.DS_Store
-            config.php
-            moodledata/**
-            cgi-bin/**
-            _moodle50_old/**
+          fetch-depth: 0
+
+      - name: Commit gia' pubblicato
+        id: base
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          INPUT_BASE: ${{ github.event.inputs.base }}
+        run: |
+          if [ "$INPUT_BASE" = "tutto" ]; then base=""
+          elif [ -n "$INPUT_BASE" ]; then base="$INPUT_BASE"
+          else
+            base=$(curl -sS --ssl-reqd --user "$FTP_USER:$FTP_PASSWORD" \
+                   "ftp://$FTP_HOST/$SITO_FTP/.bbq-deploy-commit" 2>/dev/null | tr -dc '0-9a-f' || true)
+          fi
+          echo "Sul server: ${base:-nessuno (pubblico tutto)}"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Prepara il pacchetto
+        id: pacchetto
+        run: python3 .github/bbq/prepara.py "${{ steps.base.outputs.base }}"
+
+      - name: Niente da pubblicare
+        if: steps.pacchetto.outputs.cambiati == '0' && steps.pacchetto.outputs.eliminati == '0'
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          # Aggiorna comunque il segnaposto con il commit attuale (es. solo modifiche a .github).
+          echo "$GITHUB_SHA" > marca.txt
+          curl -sS --fail --ssl-reqd --user "$FTP_USER:$FTP_PASSWORD" \
+               -T marca.txt "ftp://$FTP_HOST/$SITO_FTP/.bbq-deploy-commit"
+          echo "Il server e' gia' aggiornato (commit \`${GITHUB_SHA::9}\`)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Carica e scompatta
+        if: steps.pacchetto.outputs.cambiati != '0' || steps.pacchetto.outputs.eliminati != '0'
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chiave=$(openssl rand -hex 24)
+          nome="bbq-deploy-$(openssl rand -hex 8).php"
+          echo "::add-mask::$chiave"
+          echo "ESTRATTORE=$nome" >> "$GITHUB_ENV"
+          sed -e "s|__CHIAVE__|$chiave|" -e "s|__DATAROOT__|$DATAROOT|" .github/bbq/estrattore.php > "$nome"
+
+          ftp() { curl -sS --fail --ssl-reqd --ftp-create-dirs --retry 3 --user "$FTP_USER:$FTP_PASSWORD" "$@"; }
+          echo "Carico lo zip ($(du -h bbq-deploy.zip | cut -f1))..."
+          ftp -T bbq-deploy.zip           "ftp://$FTP_HOST/$SITO_FTP/bbq-deploy.zip"
+          ftp -T bbq-deploy-elimina.txt   "ftp://$FTP_HOST/$SITO_FTP/bbq-deploy-elimina.txt"
+          ftp -T "$nome"                  "ftp://$FTP_HOST/$SITO_FTP/public/$nome"
+
+          chiama() { curl -sS --fail --retry 3 --retry-all-errors --max-time 320 "$SITO_URL/$nome?k=$chiave&$1"; }
+          chiama "op=inizio"; echo
+
+          da=0
+          [ "${{ steps.pacchetto.outputs.cambiati }}" = "0" ] && da=-1   # solo eliminazioni
+          while [ "$da" -ge 0 ]; do
+            r=$(chiama "op=estrai&da=$da")
+            fatti=$(echo "$r" | jq -r .fatti); totale=$(echo "$r" | jq -r .totale)
+            echo "$r" | jq -r '.errori[]?' | sed 's/^/::warning::/'
+            echo "Scompattati $fatti di $totale"
+            if [ "$fatti" -ge "$totale" ]; then break; fi
+            da=$fatti
+          done
+
+          r=$(chiama "op=chiudi&c=$GITHUB_SHA"); echo "$r"
+          echo "$r" | jq -r '.errori[]?' | sed 's/^/::warning::/'
+          {
+            echo "### Moodle pubblicato su Aruba"
+            echo "- ${{ steps.pacchetto.outputs.modo }}: ${{ steps.pacchetto.outputs.cambiati }} file caricati, ${{ steps.pacchetto.outputs.eliminati }} eliminati"
+            echo "- Commit sul server: \`${GITHUB_SHA::9}\`"
+            echo "- Se è cambiata la versione di Moodle o di un plugin: aprire $SITO_URL/admin e confermare l'aggiornamento."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pulizia (sempre)
+        if: always() && env.ESTRATTORE != ''
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          # Toglie lo script temporaneo e lo zip anche se qualcosa e' andato storto.
+          for f in "public/$ESTRATTORE" bbq-deploy.zip bbq-deploy-elimina.txt; do
+            curl -sS --ssl-reqd --user "$FTP_USER:$FTP_PASSWORD" "ftp://$FTP_HOST/" \
+                 -Q "DELE /$SITO_FTP/$f" -o /dev/null 2>/dev/null && echo "eliminato $f" || true
+          done
